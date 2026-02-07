@@ -38,7 +38,9 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
-torch.autograd.set_detect_anomaly(True)
+# Detect anomaly is useful for debugging but significantly slows training.
+# Enable by setting RELGT_DETECT_ANOMALY=1.
+torch.autograd.set_detect_anomaly(os.environ.get("RELGT_DETECT_ANOMALY", "0") == "1")
 
 ############################
 # 1. Parse arguments
