@@ -256,15 +256,20 @@ def local_nodes_hetero(
 
     if num_workers is None:
         from multiprocessing import cpu_count
-        num_workers = min(cpu_count()-20, len(tasks))
+        # On many Macs, cpu_count()-20 can go <= 0; keep it sane.
+        num_workers = min(max(1, cpu_count() - 2), len(tasks))
 
-    # 4) Run neighbor sampling for each node in parallel
-    with Pool(
-        processes=num_workers,
-        initializer=init_worker_globals,
-        initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
-    ) as pool:
-        results = pool.map(_process_one_seed, tasks)
+    # 4) Run neighbor sampling
+    if num_workers <= 1:
+        init_worker_globals(adjacency, all_nodes_all_types)
+        results = list(map(_process_one_seed, tasks))
+    else:
+        with Pool(
+            processes=num_workers,
+            initializer=init_worker_globals,
+            initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
+        ) as pool:
+            results = pool.map(_process_one_seed, tasks)
 
     # 5) Build the final dictionary S
     S = {seed_node_type: {}}
@@ -479,26 +484,75 @@ class RelGTTokens(Dataset):
             hf.create_dataset("edges_offsets", data=offsets)
 
     def __getitem__(self, idx: int):
+        """Retrieve one sample.
+
+        If `self.precompute` is True and the HDF5 exists, read from HDF5.
+        Otherwise, sample neighbors on-the-fly (slower, but works on Mac without
+        precomputed files).
         """
-        Retrieve samples from HDF5 (row=idx) and the label from self.target[idx].
-        """
-        with h5py.File(self.precomputed_path, 'r') as hf:
+
+        # On-the-fly sampling path (no HDF5)
+        if (not self.precompute) or (not os.path.exists(self.precomputed_path)):
+            node_id = int(self.node_idxs[idx])
+            t = None
+            if self.time is not None:
+                t = self.time[idx]
+
+            nodes_tensor = torch.tensor([node_id], dtype=torch.long)
+            time_tensor = None
+            if t is not None:
+                time_tensor = torch.tensor([t])
+
+            S = local_nodes_hetero(
+                data=self.data.to("cpu"),
+                K=self.K,
+                table_input_nodes=(self.node_type, nodes_tensor),
+                table_input_time=time_tensor,
+                undirected=self.undirected,
+                num_workers=self.num_workers,
+            )
+
+            final_nodes, edge_index = S[self.node_type][node_id]
+            # Allocate and fill
+            types = torch.zeros((self.K,), dtype=torch.long)
+            indices = torch.zeros((self.K,), dtype=torch.long)
+            hops = torch.zeros((self.K,), dtype=torch.long)
+            times = torch.zeros((self.K,), dtype=torch.float32)
+            for j, (t_str, nbr_loc_idx, hop, t_val, _c1hops) in enumerate(final_nodes):
+                if j >= self.K:
+                    break
+                types[j] = self.node_type_to_index[t_str]
+                indices[j] = int(nbr_loc_idx)
+                hops[j] = int(hop)
+                times[j] = float(t_val)
+
             sample = {
-                "types": torch.from_numpy(hf["types"][idx]).long(),         # [K]
-                "indices": torch.from_numpy(hf["indices"][idx]).long(),     # [K]
-                "hops": torch.from_numpy(hf["hops"][idx]).long(),           # [K]
-                "times": torch.from_numpy(hf["times"][idx]),         # [K]
+                "types": types,
+                "indices": indices,
+                "hops": hops,
+                "times": times,
+                "edge_index": torch.from_numpy(edge_index).long() if hasattr(edge_index, 'shape') else edge_index,
             }
-            offsets = hf["edges_offsets"]
-            edges_dset = hf["edges"]
-            start = offsets[idx]
-            end_ = offsets[idx+1]
-            if start == end_:
-                eidx = torch.zeros((2, 0), dtype=torch.long)
-            else:
-                edge_np = edges_dset[:, start:end_]
-                eidx = torch.from_numpy(edge_np).long()
-            sample["edge_index"] = eidx
+
+        # Precomputed HDF5 path
+        else:
+            with h5py.File(self.precomputed_path, 'r') as hf:
+                sample = {
+                    "types": torch.from_numpy(hf["types"][idx]).long(),         # [K]
+                    "indices": torch.from_numpy(hf["indices"][idx]).long(),     # [K]
+                    "hops": torch.from_numpy(hf["hops"][idx]).long(),           # [K]
+                    "times": torch.from_numpy(hf["times"][idx]),                # [K]
+                }
+                offsets = hf["edges_offsets"]
+                edges_dset = hf["edges"]
+                start = offsets[idx]
+                end_ = offsets[idx+1]
+                if start == end_:
+                    eidx = torch.zeros((2, 0), dtype=torch.long)
+                else:
+                    edge_np = edges_dset[:, start:end_]
+                    eidx = torch.from_numpy(edge_np).long()
+                sample["edge_index"] = eidx
 
         # retrieve label from self.target
         label = self.target[idx] if self.target is not None else None

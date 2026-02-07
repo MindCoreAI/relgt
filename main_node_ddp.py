@@ -12,7 +12,10 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-import pynvml
+try:
+    import pynvml  # GPU utilization stats (NVIDIA only)
+except Exception:  # pragma: no cover
+    pynvml = None
 
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch.utils.data import DataLoader
@@ -20,7 +23,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F
 
-from torch_frame import stype
+from torch_frame._stype import stype
 from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.seed import seed_everything
 from tqdm import tqdm
@@ -43,7 +46,7 @@ torch.autograd.set_detect_anomaly(True)
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="rel-f1")
 parser.add_argument("--task", type=str, default="driver-top3")
-parser.add_argument("--precompute", action="store_true", default=True)
+parser.add_argument("--precompute", action="store_true", default=False)
 parser.add_argument("--lr", type=float, default=0.0001)
 parser.add_argument("--warmup_steps", type=int, default=1000)
 parser.add_argument("--epochs", type=int, default=10)
@@ -82,22 +85,53 @@ args = parser.parse_args()
 ############################
 # 2. Initialize DDP and set device
 ############################
-dist.init_process_group(backend="nccl")
-# local_rank = args.local_rank
-local_rank = int(os.environ["LOCAL_RANK"])
-device = torch.device("cuda", local_rank)
-torch.cuda.set_device(device)
+# NOTE: Original code assumes multi-GPU NVIDIA (NCCL + CUDA).
+# For CPU-only or Apple Silicon, fall back to GLOO and CPU/MPS.
+backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+# If launched with torchrun, the env vars (RANK/WORLD_SIZE/LOCAL_RANK/MASTER_*) are set.
+# Otherwise, fall back to a single-process process-group so the rest of the code (e.g.,
+# DistributedSampler) can still run.
+if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    dist.init_process_group(backend=backend)
+else:
+    dist.init_process_group(
+        backend=backend,
+        init_method="file:///tmp/relgt_dist_init",
+        rank=0,
+        world_size=1,
+    )
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+if torch.cuda.is_available():
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+elif (
+    os.environ.get("RELGT_USE_MPS", "0") == "1"
+    and getattr(torch.backends, "mps", None) is not None
+    and torch.backends.mps.is_available()
+):
+    # MPS can be flaky for some ops; enable only when explicitly requested.
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 # Only the main process (rank 0) initializes wandb and prints logs.
 if local_rank == 0:
     args.run_name = f"{args.dataset}-{args.task}-{args.run_name}"
 
 def init_gpu_utilization(device_index):
+    if (pynvml is None) or (not torch.cuda.is_available()):
+        return None
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
     return handle
 
+
 def get_gpu_stats(handle, device):
+    if handle is None:
+        return None, None, None
     util = pynvml.nvmlDeviceGetUtilizationRates(handle)
     gpu_util = util.gpu
     mem_allocated = torch.cuda.memory_allocated(device) / 1024**2
@@ -134,7 +168,7 @@ data, col_stats_dict = make_pkey_fkey_graph(
     dataset.get_db(),
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
-        text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
+        text_embedder=GloveTextEmbedding(device=device), batch_size=256
     ),
     cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
 )
@@ -253,18 +287,27 @@ for name, buf in model.named_buffers():
     if buf.dtype == torch.int16:
         buf.data = buf.data.to(torch.int64)
 
-model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+world_size = dist.get_world_size()
+
+# SyncBatchNorm/DDP are only needed for multi-process training.
+if world_size > 1:
+    if device.type == "cuda":
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    else:
+        model = DDP(model, find_unused_parameters=True)
 
 if local_rank == 0:
     print(model)
+
 total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 if local_rank == 0:
     print(f"Total model parameters: {total_params}")
 args.model_parameters = total_params
 
 if local_rank == 0:
-    wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
+    if os.environ.get("WANDB_MODE") != "disabled" and os.environ.get("WANDB_API_KEY"):
+        wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
 
 output_path = os.path.join(args.out_dir, args.dataset, args.task)
 os.makedirs(output_path, exist_ok=True)
@@ -301,7 +344,8 @@ def train_supervised(epoch) -> float:
             'flat_batch_idx': batch['flat_batch_idx'],
             'flat_nbr_idx': batch['flat_nbr_idx']
         }
-        labels = batch["labels"].to(device)
+        # MPS backend does not support float64; force labels to float32.
+        labels = batch["labels"].to(device=device, dtype=torch.float32)
 
         optimizer.zero_grad()
         pred = model(
@@ -323,7 +367,8 @@ def train_supervised(epoch) -> float:
         gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
         # Only rank 0 logs training metrics.
         if local_rank == 0:
-            wandb.log({"train_loss": loss_value,
+            if wandb.run is not None:
+                wandb.log({"train_loss": loss_value,
                        "global_step": global_step,
                        "lr": optimizer.param_groups[0]["lr"],
                        "gpu_util_percent": gpu_util,
@@ -408,29 +453,32 @@ if args.train_stage == "finetune":
         # scheduler.step()
         
         dist.barrier()
-        eval_model = model.module  # get the underlying model
+        eval_model = model.module if hasattr(model, "module") else model
         
         # Run evaluation on the validation set.
         val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
         if local_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
-            wandb.log({
-                "epoch": epoch,
-                "epoch_train_loss": train_loss,
-                **{f"val_{k}": v for k, v in val_metrics.items()}
-            })
+            if wandb.run is not None:
+                wandb.log({
+                    "epoch": epoch,
+                    "epoch_train_loss": train_loss,
+                    **{f"val_{k}": v for k, v in val_metrics.items()}
+                })
             
             if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric
             ):
                 best_val_metric = val_metrics[tune_metric]
-                state_dict = copy.deepcopy(model.module.state_dict())
+                base_model = model.module if hasattr(model, "module") else model
+                state_dict = copy.deepcopy(base_model.state_dict())
                 torch.save(state_dict, os.path.join(output_path, "finetuned.pt"))
         dist.barrier()
 
     if local_rank == 0 and state_dict is not None:
-        model.module.load_state_dict(state_dict)
+        base_model = model.module if hasattr(model, "module") else model
+        base_model.load_state_dict(state_dict)
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
     for buf in model.buffers():
@@ -438,8 +486,9 @@ if args.train_stage == "finetune":
     dist.barrier()
 
     # Final evaluation after finetuning:
-    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
-    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+    base_model = model.module if hasattr(model, "module") else model
+    final_val_preds = test(loader_dict["val"], eval_model=base_model, epoch=0, desc="Val")
+    final_test_preds = test(loader_dict["test"], eval_model=base_model, epoch=0, desc="Test")
 
     if local_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
