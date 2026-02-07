@@ -67,6 +67,14 @@ parser.add_argument("--attn_dropout", type=float, default=0.1)
 parser.add_argument("--weight_decay", type=float, default=0.00001)
 parser.add_argument("--temporal_strategy", type=str, default="uniform")
 parser.add_argument("--pos_enc", type=str, default="none")
+
+# Strategy 3: handle class imbalance in BCE losses
+parser.add_argument(
+    "--pos_weight",
+    type=float,
+    default=None,
+    help="Positive class weight for BCEWithLogitsLoss (binary/multilabel). If unset, defaults to 1.0.",
+)
 parser.add_argument("--max_degree", type=int, default=10000)
 parser.add_argument("--pos_enc_dim", type=int, default=128)
 parser.add_argument("--max_steps_per_epoch", type=int, default=3000)
@@ -235,7 +243,10 @@ loader_dict: Dict[str, DataLoader] = {"train": loader_train, "val": loader_val, 
 clamp_min, clamp_max = None, None
 if task.task_type == TaskType.BINARY_CLASSIFICATION:
     out_channels = 1
-    loss_fn = BCEWithLogitsLoss()
+    if args.pos_weight is not None:
+        loss_fn = BCEWithLogitsLoss(pos_weight=torch.tensor([args.pos_weight], dtype=torch.float32, device=device))
+    else:
+        loss_fn = BCEWithLogitsLoss()
     tune_metric = "roc_auc"
     higher_is_better = True
 elif task.task_type == TaskType.REGRESSION:
