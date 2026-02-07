@@ -73,6 +73,21 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
 parser.add_argument('--model_parameters', type=int, default=0, help='Number of model parameters')
+
+# --- Training performance knobs (CUDA) ---
+parser.add_argument(
+    "--amp",
+    action="store_true",
+    default=False,
+    help="Enable CUDA mixed precision (torch.cuda.amp).",
+)
+parser.add_argument(
+    "--grad_accum_steps",
+    type=int,
+    default=1,
+    help="Accumulate gradients over N micro-batches before optimizer step.",
+)
+
 parser.add_argument(
     "--cache_dir",
     type=str,
@@ -316,6 +331,12 @@ world_size = dist.get_world_size()
 base_lr = args.lr * world_size
 optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
 
+use_amp = bool(args.amp and device.type == "cuda")
+if args.grad_accum_steps < 1:
+    raise ValueError("--grad_accum_steps must be >= 1")
+
+scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
 global_step = 0
 
 ############################
@@ -326,10 +347,15 @@ def train_supervised(epoch) -> float:
     model.train()
     loss_accum = count_accum = 0
     total_steps = min(len(loader_dict["train"]), args.max_steps_per_epoch)
-    
+
     train_sampler.set_epoch(epoch)
-    
-    for step, batch in enumerate(tqdm(loader_dict["train"], total=total_steps, desc="Train"), start=1):
+
+    # Gradient accumulation: delay optimizer step until every N micro-batches.
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, batch in enumerate(
+        tqdm(loader_dict["train"], total=total_steps, desc="Train"), start=1
+    ):
         # Move tensors to the proper device.
         neighbor_types = batch["neighbor_types"].to(device)
         node_indices = batch["node_indices"].to(device)
@@ -339,50 +365,71 @@ def train_supervised(epoch) -> float:
         batch_vec = batch["batch"].to(device)
 
         grouped_tf_dict = {
-            'grouped_tfs': batch['grouped_tfs'],
-            'grouped_indices': batch['grouped_indices'],
-            'flat_batch_idx': batch['flat_batch_idx'],
-            'flat_nbr_idx': batch['flat_nbr_idx']
+            "grouped_tfs": batch["grouped_tfs"],
+            "grouped_indices": batch["grouped_indices"],
+            "flat_batch_idx": batch["flat_batch_idx"],
+            "flat_nbr_idx": batch["flat_nbr_idx"],
         }
         # MPS backend does not support float64; force labels to float32.
         labels = batch["labels"].to(device=device, dtype=torch.float32)
 
-        optimizer.zero_grad()
-        pred = model(
-            neighbor_types,
-            node_indices,
-            neighbor_hops,
-            neighbor_times,
-            grouped_tf_dict,
-            edge_index=edge_index,
-            batch=batch_vec
-        )
-        pred = pred.view(-1) if pred.size(1) == 1 else pred        
-        loss = loss_fn(pred.float(), labels)
-        loss.backward()
-        clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # Forward + loss (optionally in AMP autocast).
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            pred = model(
+                neighbor_types,
+                node_indices,
+                neighbor_hops,
+                neighbor_times,
+                grouped_tf_dict,
+                edge_index=edge_index,
+                batch=batch_vec,
+            )
+            pred = pred.view(-1) if pred.size(1) == 1 else pred
+            loss = loss_fn(pred.float(), labels)
+            loss = loss / args.grad_accum_steps
 
-        loss_value = loss.detach().item()
-        gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
-        # Only rank 0 logs training metrics.
-        if local_rank == 0:
-            if wandb.run is not None:
-                wandb.log({"train_loss": loss_value,
-                       "global_step": global_step,
-                       "lr": optimizer.param_groups[0]["lr"],
-                       "gpu_util_percent": gpu_util,
-                       "gpu_mem_allocated_MB": mem_allocated,
-                       "gpu_mem_reserved_MB": mem_reserved})
+        # Backward
+        scaler.scale(loss).backward()
+
+        # Logging values (de-scale for readability)
+        loss_value = (loss.detach().item()) * args.grad_accum_steps
 
         loss_accum += loss_value * pred.size(0)
         count_accum += pred.size(0)
+
+        should_step = (step % args.grad_accum_steps == 0) or (step >= args.max_steps_per_epoch)
+        if should_step:
+            # Unscale before grad clipping.
+            if use_amp:
+                scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+            gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
+            # Only rank 0 logs training metrics.
+            if local_rank == 0 and wandb.run is not None:
+                wandb.log(
+                    {
+                        "train_loss": loss_value,
+                        "global_step": global_step,
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "gpu_util_percent": gpu_util,
+                        "gpu_mem_allocated_MB": mem_allocated,
+                        "gpu_mem_reserved_MB": mem_reserved,
+                        "amp": int(use_amp),
+                        "grad_accum_steps": args.grad_accum_steps,
+                    }
+                )
+
         global_step += 1
 
         if step >= args.max_steps_per_epoch:
             break
 
-    return loss_accum / count_accum if count_accum > 0 else float('inf')
+    return loss_accum / count_accum if count_accum > 0 else float("inf")
 
 @torch.no_grad()
 def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
