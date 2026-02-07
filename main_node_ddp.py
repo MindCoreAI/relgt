@@ -394,7 +394,7 @@ def train_supervised(epoch) -> float:
     return loss_accum / count_accum if count_accum > 0 else float('inf')
 
 @torch.no_grad()
-def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
+def test(loader: DataLoader, eval_model, epoch, desc, return_idx: bool = False):
     if loader.sampler is not None and hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
         
@@ -443,10 +443,14 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
 
     if local_rank == 0:
         all_preds = np.full((len(loader.dataset),), -100.0)
+        all_idxs = np.full((len(loader.dataset),), -1)
         for i in range(world_size):
             g_idx, g_pred = gathered[i]
             for idx, pred in zip(g_idx, g_pred):
                 all_preds[idx] = pred
+                all_idxs[idx] = idx
+        if return_idx:
+            return all_idxs, all_preds
         return all_preds
     else:
         return None
@@ -506,9 +510,38 @@ if args.train_stage == "finetune":
         test_metrics = task.evaluate(final_test_preds)
         print(f"Best Test metrics: {test_metrics}")
 
+        # Strategy 2 (fast): tune threshold for best F1 on validation for binary classification.
+        tuned = None
+        if task.task_type == TaskType.BINARY_CLASSIFICATION:
+            # Grab labels aligned to the prediction order.
+            y_val = task.get_table("val").df[task.target_col].to_numpy().astype(float)
+            y_test = task.get_table("test").df[task.target_col].to_numpy().astype(float)
+
+            thresholds = np.linspace(0.01, 0.99, 99)
+            best_thr = None
+            best_f1 = -1.0
+            for thr in thresholds:
+                yhat = (final_val_preds >= thr).astype(float)
+                f1 = task.evaluate(yhat, task.get_table("val")).get("f1", float("nan"))
+                if np.isfinite(f1) and f1 > best_f1:
+                    best_f1 = f1
+                    best_thr = float(thr)
+
+            if best_thr is not None:
+                val_metrics_thr = task.evaluate((final_val_preds >= best_thr).astype(float), task.get_table("val"))
+                test_metrics_thr = task.evaluate((final_test_preds >= best_thr).astype(float), task.get_table("test"))
+                tuned = {
+                    "threshold": best_thr,
+                    "val_metrics_at_threshold": val_metrics_thr,
+                    "test_metrics_at_threshold": test_metrics_thr,
+                }
+                print(f"[Threshold Tune] best_thr={best_thr} val_f1={val_metrics_thr.get('f1')}")
+                print(f"[Threshold Tune] test_metrics={test_metrics_thr}")
+
         best_metrics_dict = {
             "val_metrics": val_metrics,
-            "test_metrics": test_metrics
+            "test_metrics": test_metrics,
+            "threshold_tuning": tuned,
         }
         file_path = os.path.join(output_path, str(args.seed) + ".json")
         with open(file_path, "w") as f:
