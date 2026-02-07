@@ -373,7 +373,7 @@ def train_supervised(epoch) -> float:
         # MPS backend does not support float64; force labels to float32.
         labels = batch["labels"].to(device=device, dtype=torch.float32)
 
-        # Forward + loss (optionally in AMP autocast).
+        # Forward (optionally in AMP autocast). Compute the loss in fp32 for stability.
         with torch.cuda.amp.autocast(enabled=use_amp):
             pred = model(
                 neighbor_types,
@@ -385,8 +385,10 @@ def train_supervised(epoch) -> float:
                 batch=batch_vec,
             )
             pred = pred.view(-1) if pred.size(1) == 1 else pred
-            loss = loss_fn(pred.float(), labels)
-            loss = loss / args.grad_accum_steps
+
+        # Keep loss in fp32 even under AMP (BCEWithLogits can overflow in fp16).
+        loss = loss_fn(pred.float(), labels)
+        loss = loss / args.grad_accum_steps
 
         # Backward
         scaler.scale(loss).backward()
