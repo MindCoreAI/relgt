@@ -54,5 +54,8 @@ Shared settings (intended):
 
 ### driver-position
 - BS=1024: OOM
-- BS=512: running as of 2026-02-07 01:06 ET (GPU ~100% util, ~11GB VRAM used)
+- **BS=512: completed**
+  - Best Val: r2 **0.2922098644**, mae **3.1276646954**, rmse **3.9003406779**
+  - Best Test: r2 **0.1797089060**, mae **3.9104570101**, rmse **4.7190421238**
+  - real: **1235.16s**
 
