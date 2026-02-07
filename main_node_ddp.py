@@ -386,8 +386,12 @@ def train_supervised(epoch) -> float:
             )
             pred = pred.view(-1) if pred.size(1) == 1 else pred
 
-        # Keep loss in fp32 even under AMP (BCEWithLogits can overflow in fp16).
-        loss = loss_fn(pred.float(), labels)
+        # Keep loss in fp32 even under AMP (BCEWithLogits can overflow / produce NaNs).
+        pred_fp32 = pred.float()
+        # Extra safety: clamp logits to a reasonable range to avoid inf/nan in BCE.
+        if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
+            pred_fp32 = pred_fp32.clamp(min=-30.0, max=30.0)
+        loss = loss_fn(pred_fp32, labels)
         loss = loss / args.grad_accum_steps
 
         # Backward
