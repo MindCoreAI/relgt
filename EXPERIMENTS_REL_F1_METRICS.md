@@ -59,3 +59,25 @@ Shared settings (intended):
   - Best Test: r2 **0.1797089060**, mae **3.9104570101**, rmse **4.7190421238**
   - real: **1235.16s**
 
+---
+
+## Strategy 1 – Gradient accumulation (NO AMP) on WSL CUDA
+Goal: keep effective batch size similar to large-base settings while avoiding CUDA OOM.
+
+Settings: same as large-base-style rel-f1 (layers=4, channels=512, dropout=0.3, epochs=10, max_steps=500, neighbors=300, seed=0, precompute). GPU: GTX 1080 Ti.
+
+### driver-dnf (accum-only)
+- micro-batch size: **128**, grad_accum_steps: **4** (effective ≈ 512)
+- Best Val: AP **0.9267476479**, acc **0.7915194346**, f1 **0.8691796009**, roc_auc **0.7787210884**
+- Best Test: AP **0.8019643342**, acc **0.6866096866**, f1 **0.8119658120**, roc_auc **0.6050651442**
+- real: **1697.27s**
+
+### driver-top3 (accum-only)
+- micro-batch size: **256**, grad_accum_steps: **2** (effective ≈ 512)
+- Best Val: AP **0.4507588510**, acc **0.7551020408**, f1 **0.4666666667**, roc_auc **0.7291662934**
+- Best Test: AP **0.3342315649**, acc **0.6294765840**, f1 **0.2864721485**, roc_auc **0.6890546614**
+- real: **1680.54s**
+
+### AMP status
+Attempting `--amp` currently triggers NaNs during backward on this stack (e.g. AddmmBackward0/BCEWithLogitsBackward0 returned NaNs). Proceeding without AMP for now.
+
