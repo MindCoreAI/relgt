@@ -97,3 +97,19 @@ Settings: same as large-base-style rel-f1 (layers=4, channels=512, dropout=0.3, 
 ### AMP status
 Attempting `--amp` currently triggers NaNs during backward on this stack (e.g. AddmmBackward0/BCEWithLogitsBackward0 returned NaNs). Proceeding without AMP for now.
 
+---
+
+## Strategy 2 – Threshold tuning (best val F1)
+Status: **dnf run failed** on Ubuntu due to CUDA OOM during DataLoader pin_memory.
+- error: `RuntimeError: CUDA error: out of memory` (in pin_memory)
+- real: **2526.34s**
+
+## Strategy 3 – pos_weight (BCEWithLogitsLoss)
+### driver-dnf (bs=128, pos_weight=0.136)
+- Best Val: AP **0.9298573244**, acc **0.5141342756**, f1 **0.5557350565**, roc_auc **0.7894240363**
+- Best Test: AP **0.8431122637**, acc **0.6054131054**, f1 **0.6524466750**, roc_auc **0.6929878495**
+- real: **2930.14s**
+
+### driver-top3
+- pending
+
