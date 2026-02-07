@@ -38,7 +38,9 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
-torch.autograd.set_detect_anomaly(True)
+# Detect anomaly is useful for debugging but significantly slows training.
+# Enable by setting RELGT_DETECT_ANOMALY=1.
+torch.autograd.set_detect_anomaly(os.environ.get("RELGT_DETECT_ANOMALY", "0") == "1")
 
 ############################
 # 1. Parse arguments
@@ -69,6 +71,12 @@ parser.add_argument("--max_degree", type=int, default=10000)
 parser.add_argument("--pos_enc_dim", type=int, default=128)
 parser.add_argument("--max_steps_per_epoch", type=int, default=3000)
 parser.add_argument("--num_workers", type=int, default=2)
+parser.add_argument(
+    "--pin_memory",
+    type=int,
+    default=0,
+    help="DataLoader pin_memory (1=true,0=false). Default off (helps avoid CUDA OOM in pin_memory on WSL).",
+)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
@@ -191,25 +199,27 @@ data = {
 # 4. Create DataLoaders (with a DistributedSampler for training)
 ############################
 train_sampler = DistributedSampler(data["train"], shuffle=True, seed=args.seed)
+pin_memory = bool(getattr(args, "pin_memory", None)) if hasattr(args, "pin_memory") and args.pin_memory is not None else (device.type == "cuda")
+
 loader_train = DataLoader(
-    data["train"], 
-    batch_size=args.batch_size, 
+    data["train"],
+    batch_size=args.batch_size,
     sampler=train_sampler,
     collate_fn=data["train"].collate,
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
-    pin_memory=True)
+    pin_memory=pin_memory,
+)
 
 val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False)
 loader_val = DataLoader(
     data["val"],
     batch_size=args.batch_size,
     sampler=val_sampler,
-    # shuffle=False,
     collate_fn=data["val"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True
+    pin_memory=pin_memory,
 )
 
 test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False)
@@ -217,11 +227,10 @@ loader_test = DataLoader(
     data["test"],
     batch_size=args.batch_size,
     sampler=test_sampler,
-    # shuffle=False,
     collate_fn=data["test"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True
+    pin_memory=pin_memory,
 )
 
 
