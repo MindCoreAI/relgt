@@ -388,11 +388,19 @@ def train_supervised(epoch) -> float:
 
         # Keep loss in fp32 even under AMP (BCEWithLogits can overflow / produce NaNs).
         pred_fp32 = pred.float()
-        # Extra safety: clamp logits to a reasonable range to avoid inf/nan in BCE.
+        # Sanitize + clamp logits to avoid inf/nan in BCE.
+        pred_fp32 = torch.nan_to_num(pred_fp32, nan=0.0, posinf=30.0, neginf=-30.0)
         if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
             pred_fp32 = pred_fp32.clamp(min=-30.0, max=30.0)
         loss = loss_fn(pred_fp32, labels)
         loss = loss / args.grad_accum_steps
+
+        # Skip non-finite loss (can happen under AMP). Clear grads and continue.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            if local_rank == 0:
+                print("[WARN] Non-finite loss encountered; skipping step")
+            continue
 
         # Backward
         scaler.scale(loss).backward()
