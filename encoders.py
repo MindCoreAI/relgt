@@ -243,6 +243,9 @@ class NeighborTfsEncoder(nn.Module):
                 out_t = out_t.squeeze(1)  # => [num_rows, channels]
 
             # Insert each row into encoded_flat_tensor
+            # AMP can produce fp16 outputs; ensure dtype matches destination tensor.
+            if out_t.dtype != encoded_flat_tensor.dtype:
+                out_t = out_t.to(encoded_flat_tensor.dtype)
             idx_list = grouped_indices[t_int]
             idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
             encoded_flat_tensor[idx_tensor] = out_t
