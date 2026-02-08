@@ -513,15 +513,12 @@ if args.train_stage == "finetune":
         # Strategy 2 (fast): tune threshold for best F1 on validation for binary classification.
         tuned = None
         if task.task_type == TaskType.BINARY_CLASSIFICATION:
-            # Grab labels aligned to the prediction order.
-            y_val = task.get_table("val").df[task.target_col].to_numpy().astype(float)
-            y_test = task.get_table("test").df[task.target_col].to_numpy().astype(float)
-
             thresholds = np.linspace(0.01, 0.99, 99)
             best_thr = None
             best_f1 = -1.0
             for thr in thresholds:
                 yhat = (final_val_preds >= thr).astype(float)
+                # Evaluate against val table; task.evaluate will pull targets from the table.
                 f1 = task.evaluate(yhat, task.get_table("val")).get("f1", float("nan"))
                 if np.isfinite(f1) and f1 > best_f1:
                     best_f1 = f1
