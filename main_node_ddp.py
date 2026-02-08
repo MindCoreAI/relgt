@@ -80,6 +80,12 @@ parser.add_argument("--pos_enc_dim", type=int, default=128)
 parser.add_argument("--max_steps_per_epoch", type=int, default=3000)
 parser.add_argument("--num_workers", type=int, default=2)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--threshold_tune",
+    type=int,
+    default=0,
+    help="If 1 and binary classification, tune prediction threshold for best val F1.",
+)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
 parser.add_argument('--model_parameters', type=int, default=0, help='Number of model parameters')
@@ -514,13 +520,10 @@ if args.train_stage == "finetune":
         test_metrics = task.evaluate(final_test_preds)
         print(f"Best Test metrics: {test_metrics}")
 
-        # Strategy 2 (fast): tune threshold for best F1 on validation for binary classification.
+        # Optional: tune threshold for best F1 on validation for binary classification.
+        # Disabled by default so Strategy 3 runs don't depend on test table label columns.
         tuned = None
-        if task.task_type == TaskType.BINARY_CLASSIFICATION:
-            # Grab labels aligned to the prediction order.
-            y_val = task.get_table("val").df[task.target_col].to_numpy().astype(float)
-            y_test = task.get_table("test").df[task.target_col].to_numpy().astype(float)
-
+        if getattr(args, "threshold_tune", 0) == 1 and task.task_type == TaskType.BINARY_CLASSIFICATION:
             thresholds = np.linspace(0.01, 0.99, 99)
             best_thr = None
             best_f1 = -1.0
