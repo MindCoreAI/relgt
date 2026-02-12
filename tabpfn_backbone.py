@@ -64,7 +64,8 @@ def _tensorframe_to_numpy(tf: "torch_frame.data.TensorFrame") -> np.ndarray:
 @dataclass
 class TabPFNBackboneConfig:
     # Keep small for speed; this is a smoke-test integration.
-    max_fit_rows: int = 200
+    max_fit_rows: int = 50
+    max_fit_cols: int = 32
     random_state: int = 0
 
 
@@ -115,10 +116,20 @@ class TabPFNBackbone(nn.Module):
             ) from e
 
         n = X.shape[0]
+        d = X.shape[1]
         n_fit = min(n, self.config.max_fit_rows)
         rng = np.random.default_rng(self.config.random_state)
         idx = rng.choice(n, size=n_fit, replace=False) if n_fit < n else np.arange(n)
         X_fit = X[idx]
+
+        # Subsample columns for speed if the table is wide.
+        if d > self.config.max_fit_cols:
+            col_idx = rng.choice(d, size=self.config.max_fit_cols, replace=False)
+            col_idx.sort()
+            X_fit = X_fit[:, col_idx]
+            self._col_idx = col_idx
+        else:
+            self._col_idx = None
 
         # Ensure we have enough non-constant signal for TabPFN's validation.
         if X_fit.shape[0] < 2:
@@ -147,7 +158,10 @@ class TabPFNBackbone(nn.Module):
         X = _tensorframe_to_numpy(tf)
         self._ensure_fitted(X)
 
-        proba = self._clf.predict_proba(X)  # [N, C]
+        X_in = X
+        if getattr(self, "_col_idx", None) is not None:
+            X_in = X[:, self._col_idx]
+        proba = self._clf.predict_proba(X_in)  # [N, C]
         proba_t = torch.from_numpy(proba).to(dtype=torch.float32)
 
         if self._proj is None:
