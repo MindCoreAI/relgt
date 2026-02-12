@@ -450,7 +450,7 @@ if args.train_stage == "finetune":
         # scheduler.step()
         
         dist.barrier()
-        eval_model = model.module  # get the underlying model
+        eval_model = model.module if hasattr(model, "module") else model  # underlying model
         
         # Run evaluation on the validation set.
         val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
