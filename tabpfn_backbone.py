@@ -63,7 +63,8 @@ def _tensorframe_to_numpy(tf: "torch_frame.data.TensorFrame") -> np.ndarray:
 
 @dataclass
 class TabPFNBackboneConfig:
-    max_fit_rows: int = 1000
+    # Keep small for speed; this is a smoke-test integration.
+    max_fit_rows: int = 200
     random_state: int = 0
 
 
@@ -131,7 +132,14 @@ class TabPFNBackbone(nn.Module):
         # Synthetic binary labels (balanced) purely to enable fit().
         y_fit = rng.integers(0, 2, size=n_fit, dtype=np.int64)
 
-        clf = TabPFNClassifier(device="cpu", ignore_pretraining_limits=True, random_state=self.config.random_state)
+        clf = TabPFNClassifier(
+            device="cpu",
+            ignore_pretraining_limits=True,
+            random_state=self.config.random_state,
+            n_estimators=1,
+            fit_mode="low_memory",
+            n_preprocessing_jobs=1,
+        )
         clf.fit(X_fit, y_fit)
         self._clf = clf
 
