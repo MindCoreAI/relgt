@@ -118,6 +118,16 @@ class TabPFNBackbone(nn.Module):
         rng = np.random.default_rng(self.config.random_state)
         idx = rng.choice(n, size=n_fit, replace=False) if n_fit < n else np.arange(n)
         X_fit = X[idx]
+
+        # Ensure we have enough non-constant signal for TabPFN's validation.
+        if X_fit.shape[0] < 2:
+            X_fit = np.repeat(X_fit, repeats=2, axis=0)
+            n_fit = X_fit.shape[0]
+
+        col_std = X_fit.std(axis=0)
+        if np.all(col_std == 0):
+            X_fit = X_fit + rng.normal(0.0, 1e-3, size=X_fit.shape)
+
         # Synthetic binary labels (balanced) purely to enable fit().
         y_fit = rng.integers(0, 2, size=n_fit, dtype=np.int64)
 
