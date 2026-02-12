@@ -256,15 +256,19 @@ def local_nodes_hetero(
 
     if num_workers is None:
         from multiprocessing import cpu_count
-        num_workers = min(cpu_count()-20, len(tasks))
+        # On smaller machines, cpu_count()-20 can go <= 0; ensure at least 1.
+        num_workers = min(max(cpu_count() - 2, 1), len(tasks))
 
-    # 4) Run neighbor sampling for each node in parallel
-    with Pool(
-        processes=num_workers,
-        initializer=init_worker_globals,
-        initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
-    ) as pool:
-        results = pool.map(_process_one_seed, tasks)
+    if num_workers <= 1:
+        results = [_process_one_seed(t) for t in tasks]
+    else:
+        # 4) Run neighbor sampling for each node in parallel
+        with Pool(
+            processes=num_workers,
+            initializer=init_worker_globals,
+            initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
+        ) as pool:
+            results = pool.map(_process_one_seed, tasks)
 
     # 5) Build the final dictionary S
     S = {seed_node_type: {}}
@@ -489,15 +493,19 @@ class RelGTTokens(Dataset):
                 "hops": torch.from_numpy(hf["hops"][idx]).long(),           # [K]
                 "times": torch.from_numpy(hf["times"][idx]),         # [K]
             }
-            offsets = hf["edges_offsets"]
-            edges_dset = hf["edges"]
-            start = offsets[idx]
-            end_ = offsets[idx+1]
-            if start == end_:
+            # Some older/partial precompute files may not include edge datasets.
+            try:
+                offsets = hf["edges_offsets"]
+                edges_dset = hf["edges"]
+                start = offsets[idx]
+                end_ = offsets[idx + 1]
+                if start == end_:
+                    eidx = torch.zeros((2, 0), dtype=torch.long)
+                else:
+                    edge_np = edges_dset[:, start:end_]
+                    eidx = torch.from_numpy(edge_np).long()
+            except Exception:
                 eidx = torch.zeros((2, 0), dtype=torch.long)
-            else:
-                edge_np = edges_dset[:, start:end_]
-                eidx = torch.from_numpy(edge_np).long()
             sample["edge_index"] = eidx
 
         # retrieve label from self.target
