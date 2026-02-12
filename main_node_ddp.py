@@ -12,7 +12,10 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-import pynvml
+try:
+    import pynvml  # GPU utilization stats (NVIDIA only)
+except Exception:  # pragma: no cover
+    pynvml = None
 
 from torch.nn import BCEWithLogitsLoss, L1Loss
 from torch.utils.data import DataLoader
@@ -35,7 +38,9 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
-torch.autograd.set_detect_anomaly(True)
+# Detect anomaly is useful for debugging but significantly slows training.
+# Enable by setting RELGT_DETECT_ANOMALY=1.
+torch.autograd.set_detect_anomaly(os.environ.get("RELGT_DETECT_ANOMALY", "0") == "1")
 
 ############################
 # 1. Parse arguments
@@ -70,6 +75,16 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
 parser.add_argument('--model_parameters', type=int, default=0, help='Number of model parameters')
+
+# Tabular (TorchFrame) row encoder choice
+parser.add_argument(
+    "--tf_model",
+    type=str,
+    default="resnet",
+    choices=["resnet", "mlp"],
+    help="TorchFrame encoder backbone for table features.",
+)
+
 parser.add_argument(
     "--cache_dir",
     type=str,
@@ -82,22 +97,40 @@ args = parser.parse_args()
 ############################
 # 2. Initialize DDP and set device
 ############################
-dist.init_process_group(backend="nccl")
-# local_rank = args.local_rank
-local_rank = int(os.environ["LOCAL_RANK"])
-device = torch.device("cuda", local_rank)
-torch.cuda.set_device(device)
+backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    dist.init_process_group(backend=backend)
+else:
+    dist.init_process_group(
+        backend=backend,
+        init_method="file:///tmp/relgt_dist_init",
+        rank=0,
+        world_size=1,
+    )
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+if torch.cuda.is_available():
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+else:
+    device = torch.device("cpu")
 
 # Only the main process (rank 0) initializes wandb and prints logs.
 if local_rank == 0:
     args.run_name = f"{args.dataset}-{args.task}-{args.run_name}"
 
 def init_gpu_utilization(device_index):
+    if (pynvml is None) or (not torch.cuda.is_available()):
+        return None
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
     return handle
 
 def get_gpu_stats(handle, device):
+    if handle is None:
+        return None, None, None
     util = pynvml.nvmlDeviceGetUtilizationRates(handle)
     gpu_util = util.gpu
     mem_allocated = torch.cuda.memory_allocated(device) / 1024**2
@@ -134,7 +167,7 @@ data, col_stats_dict = make_pkey_fkey_graph(
     dataset.get_db(),
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
-        text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
+        text_embedder=GloveTextEmbedding(device=device), batch_size=256
     ),
     cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
 )
@@ -253,18 +286,27 @@ for name, buf in model.named_buffers():
     if buf.dtype == torch.int16:
         buf.data = buf.data.to(torch.int64)
 
-model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+world_size = dist.get_world_size()
+
+# Only wrap with DDP when using multi-process training.
+if world_size > 1:
+    if device.type == "cuda":
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    else:
+        model = DDP(model, find_unused_parameters=True)
 
 if local_rank == 0:
     print(model)
+
 total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 if local_rank == 0:
     print(f"Total model parameters: {total_params}")
 args.model_parameters = total_params
 
 if local_rank == 0:
-    wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
+    if os.environ.get("WANDB_MODE") != "disabled" and os.environ.get("WANDB_API_KEY"):
+        wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
 
 output_path = os.path.join(args.out_dir, args.dataset, args.task)
 os.makedirs(output_path, exist_ok=True)
@@ -322,7 +364,7 @@ def train_supervised(epoch) -> float:
         loss_value = loss.detach().item()
         gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
         # Only rank 0 logs training metrics.
-        if local_rank == 0:
+        if local_rank == 0 and wandb.run is not None:
             wandb.log({"train_loss": loss_value,
                        "global_step": global_step,
                        "lr": optimizer.param_groups[0]["lr"],
@@ -415,11 +457,12 @@ if args.train_stage == "finetune":
         if local_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
-            wandb.log({
-                "epoch": epoch,
-                "epoch_train_loss": train_loss,
-                **{f"val_{k}": v for k, v in val_metrics.items()}
-            })
+            if wandb.run is not None:
+                wandb.log({
+                    "epoch": epoch,
+                    "epoch_train_loss": train_loss,
+                    **{f"val_{k}": v for k, v in val_metrics.items()}
+                })
             
             if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric
@@ -438,8 +481,9 @@ if args.train_stage == "finetune":
     dist.barrier()
 
     # Final evaluation after finetuning:
-    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
-    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+    base_model = model.module if hasattr(model, "module") else model
+    final_val_preds = test(loader_dict["val"], eval_model=base_model, epoch=0, desc="Val")
+    final_test_preds = test(loader_dict["test"], eval_model=base_model, epoch=0, desc="Test")
 
     if local_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))

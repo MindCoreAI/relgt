@@ -14,6 +14,8 @@ from local_module import LocalModule
 from torch_frame.data.stats import StatType
 from typing import Dict, Any, List
 
+import torch_frame
+
 from encoders import NeighborNodeTypeEncoder, NeighborHopEncoder, NeighborTimeEncoder, NeighborTfsEncoder, GNNPEEncoder
 
 class RelGTLayer(nn.Module):
@@ -193,7 +195,24 @@ class RelGT(torch.nn.Module):
         self.type_encoder = NeighborNodeTypeEncoder(embedding_dim=channels, node_type_map=self.node_type_map)
         self.hop_encoder = NeighborHopEncoder(embedding_dim=channels, max_neighbor_hop=self.max_neighbor_hop)
         self.time_encoder = NeighborTimeEncoder(embedding_dim=channels)
-        self.tfs_encoder = NeighborTfsEncoder(channels=channels, node_type_map=self.node_type_map, col_names_dict=col_names_dict, col_stats_dict=col_stats_dict)
+
+        # TorchFrame backbone selection (default: ResNet)
+        tf_model = getattr(args, "tf_model", "resnet") if args is not None else "resnet"
+        if tf_model == "mlp":
+            torch_frame_model_cls = torch_frame.nn.models.MLP
+            torch_frame_model_kwargs = {"channels": 128, "num_layers": 4}
+        else:
+            torch_frame_model_cls = torch_frame.nn.models.ResNet
+            torch_frame_model_kwargs = {"channels": 128, "num_layers": 4}
+
+        self.tfs_encoder = NeighborTfsEncoder(
+            channels=channels,
+            node_type_map=self.node_type_map,
+            col_names_dict=col_names_dict,
+            col_stats_dict=col_stats_dict,
+            torch_frame_model_cls=torch_frame_model_cls,
+            torch_frame_model_kwargs=torch_frame_model_kwargs,
+        )
         self.pe_encoder = GNNPEEncoder(embedding_dim=channels, pe_dim = gnn_pe_dim)
 
         self.layer_norm_type = nn.LayerNorm(channels)
