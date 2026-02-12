@@ -468,12 +468,14 @@ if args.train_stage == "finetune":
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric
             ):
                 best_val_metric = val_metrics[tune_metric]
-                state_dict = copy.deepcopy(model.module.state_dict())
+                base_model = model.module if hasattr(model, "module") else model
+                state_dict = copy.deepcopy(base_model.state_dict())
                 torch.save(state_dict, os.path.join(output_path, "finetuned.pt"))
         dist.barrier()
 
     if local_rank == 0 and state_dict is not None:
-        model.module.load_state_dict(state_dict)
+        base_model = model.module if hasattr(model, "module") else model
+        base_model.load_state_dict(state_dict)
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
     for buf in model.buffers():
