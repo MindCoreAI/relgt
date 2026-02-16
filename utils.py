@@ -489,15 +489,19 @@ class RelGTTokens(Dataset):
                 "hops": torch.from_numpy(hf["hops"][idx]).long(),           # [K]
                 "times": torch.from_numpy(hf["times"][idx]),         # [K]
             }
-            offsets = hf["edges_offsets"]
-            edges_dset = hf["edges"]
-            start = offsets[idx]
-            end_ = offsets[idx+1]
-            if start == end_:
+            # Some older/partial precompute files may not include edge datasets.
+            try:
+                offsets = hf["edges_offsets"]
+                edges_dset = hf["edges"]
+                start = offsets[idx]
+                end_ = offsets[idx + 1]
+                if start == end_:
+                    eidx = torch.zeros((2, 0), dtype=torch.long)
+                else:
+                    edge_np = edges_dset[:, start:end_]
+                    eidx = torch.from_numpy(edge_np).long()
+            except Exception:
                 eidx = torch.zeros((2, 0), dtype=torch.long)
-            else:
-                edge_np = edges_dset[:, start:end_]
-                eidx = torch.from_numpy(edge_np).long()
             sample["edge_index"] = eidx
 
         # retrieve label from self.target
