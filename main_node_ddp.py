@@ -35,7 +35,9 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
-torch.autograd.set_detect_anomaly(True)
+# NOTE: detect_anomaly is very slow; keep it off for benchmarks unless debugging.
+# It can be enabled via --detect_anomaly.
+
 
 ############################
 # 1. Parse arguments
@@ -67,6 +69,10 @@ parser.add_argument("--pos_enc_dim", type=int, default=128)
 parser.add_argument("--max_steps_per_epoch", type=int, default=3000)
 parser.add_argument("--num_workers", type=int, default=2)
 parser.add_argument("--log_every", type=int, default=20, help="Log/sync metrics every N train steps")
+parser.add_argument("--detect_anomaly", action="store_true", default=False, help="Enable torch autograd anomaly detection (very slow)")
+parser.add_argument("--print_model", action="store_true", default=False, help="Print full model summary (can be slow)")
+parser.add_argument("--ddp_find_unused_parameters", action="store_true", default=False, help="Set DDP find_unused_parameters=True")
+parser.add_argument("--sync_batchnorm", action="store_true", default=False, help="Convert model BatchNorm -> SyncBatchNorm (useful for multi-GPU)")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
@@ -79,6 +85,9 @@ parser.add_argument(
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
 
 args = parser.parse_args()
+
+# Debug option: anomaly detection is extremely slow.
+torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
 ############################
 # 2. Initialize DDP and set device
@@ -254,10 +263,19 @@ for name, buf in model.named_buffers():
     if buf.dtype == torch.int16:
         buf.data = buf.data.to(torch.int64)
 
-model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+world_size = dist.get_world_size()
 
-if local_rank == 0:
+# SyncBatchNorm and find_unused_parameters add overhead; default them off for single-GPU.
+if args.sync_batchnorm and world_size > 1:
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+model = DDP(
+    model,
+    device_ids=[local_rank],
+    find_unused_parameters=bool(args.ddp_find_unused_parameters),
+)
+
+if local_rank == 0 and args.print_model:
     print(model)
 total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 if local_rank == 0:
@@ -270,7 +288,6 @@ if local_rank == 0:
 output_path = os.path.join(args.out_dir, args.dataset, args.task)
 os.makedirs(output_path, exist_ok=True)
 
-world_size = dist.get_world_size()
 base_lr = args.lr * world_size
 optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
 
