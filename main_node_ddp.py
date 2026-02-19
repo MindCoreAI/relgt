@@ -66,6 +66,7 @@ parser.add_argument("--max_degree", type=int, default=10000)
 parser.add_argument("--pos_enc_dim", type=int, default=128)
 parser.add_argument("--max_steps_per_epoch", type=int, default=3000)
 parser.add_argument("--num_workers", type=int, default=2)
+parser.add_argument("--log_every", type=int, default=20, help="Log/sync metrics every N train steps")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
@@ -288,12 +289,12 @@ def train_supervised(epoch) -> float:
     
     for step, batch in enumerate(tqdm(loader_dict["train"], total=total_steps, desc="Train"), start=1):
         # Move tensors to the proper device.
-        neighbor_types = batch["neighbor_types"].to(device)
-        node_indices = batch["node_indices"].to(device)
-        neighbor_hops = batch["neighbor_hops"].to(device)
-        neighbor_times = batch["neighbor_times"].to(device)
-        edge_index = batch["edge_index"].to(device)
-        batch_vec = batch["batch"].to(device)
+        neighbor_types = batch["neighbor_types"].to(device, non_blocking=True)
+        node_indices = batch["node_indices"].to(device, non_blocking=True)
+        neighbor_hops = batch["neighbor_hops"].to(device, non_blocking=True)
+        neighbor_times = batch["neighbor_times"].to(device, non_blocking=True)
+        edge_index = batch["edge_index"].to(device, non_blocking=True)
+        batch_vec = batch["batch"].to(device, non_blocking=True)
 
         grouped_tf_dict = {
             'grouped_tfs': batch['grouped_tfs'],
@@ -319,11 +320,12 @@ def train_supervised(epoch) -> float:
         clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        loss_value = loss.detach().item()
-        gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
-        # Only rank 0 logs training metrics.
-        if local_rank == 0:
-            wandb.log({"train_loss": loss_value,
+        # Avoid frequent CPU<->GPU sync: only call .item()/NVML every log_every steps.
+        loss_value = float(loss.detach())
+        if (local_rank == 0) and (global_step % max(1, args.log_every) == 0) and (wandb.run is not None):
+            loss_value_item = loss.detach().item()
+            gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
+            wandb.log({"train_loss": loss_value_item,
                        "global_step": global_step,
                        "lr": optimizer.param_groups[0]["lr"],
                        "gpu_util_percent": gpu_util,
@@ -349,12 +351,12 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     idx_list = []
     
     for batch in tqdm(loader, desc=desc, disable=(local_rank != 0)):
-        neighbor_types = batch["neighbor_types"].to(device)
-        node_indices = batch["node_indices"].to(device)
-        neighbor_hops = batch["neighbor_hops"].to(device)
-        neighbor_times = batch["neighbor_times"].to(device)
-        edge_index = batch["edge_index"].to(device)
-        batch_vec = batch["batch"].to(device)
+        neighbor_types = batch["neighbor_types"].to(device, non_blocking=True)
+        node_indices = batch["node_indices"].to(device, non_blocking=True)
+        neighbor_hops = batch["neighbor_hops"].to(device, non_blocking=True)
+        neighbor_times = batch["neighbor_times"].to(device, non_blocking=True)
+        edge_index = batch["edge_index"].to(device, non_blocking=True)
+        batch_vec = batch["batch"].to(device, non_blocking=True)
         
         grouped_tf_dict = {
             'grouped_tfs': batch['grouped_tfs'],

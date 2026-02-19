@@ -254,17 +254,11 @@ def local_nodes_hetero(
         seed_val = hash((seed_node_type, node_idx, seed_t, K)) & 0xffffffff
         tasks.append((data, K, seed_node_type, node_idx, seed_t, seed_val))
 
-    if num_workers is None:
-        from multiprocessing import cpu_count
-        num_workers = min(cpu_count()-20, len(tasks))
-
-    # 4) Run neighbor sampling for each node in parallel
-    with Pool(
-        processes=num_workers,
-        initializer=init_worker_globals,
-        initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
-    ) as pool:
-        results = pool.map(_process_one_seed, tasks)
+    # NOTE: This function can be called inside a PyTorch DataLoader worker.
+    # Spawning a multiprocessing.Pool here is expensive and can crash (daemonic workers).
+    # We do sampling in-process and rely on DataLoader workers for parallelism.
+    init_worker_globals(adjacency, all_nodes_all_types)
+    results = list(map(_process_one_seed, tasks))
 
     # 5) Build the final dictionary S
     S = {seed_node_type: {}}
