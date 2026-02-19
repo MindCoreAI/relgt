@@ -71,6 +71,7 @@ parser.add_argument("--num_workers", type=int, default=2)
 parser.add_argument("--log_every", type=int, default=20, help="Log/sync metrics every N train steps")
 parser.add_argument("--detect_anomaly", action="store_true", default=False, help="Enable torch autograd anomaly detection (very slow)")
 parser.add_argument("--print_model", action="store_true", default=False, help="Print full model summary (can be slow)")
+parser.add_argument("--no_ddp", action="store_true", default=False, help="Run without torch.distributed/DDP (recommended for single-GPU)")
 parser.add_argument("--ddp_no_find_unused_parameters", action="store_true", default=False, help="(Danger) Set DDP find_unused_parameters=False")
 parser.add_argument("--sync_batchnorm", action="store_true", default=False, help="Convert model BatchNorm -> SyncBatchNorm (useful for multi-GPU)")
 parser.add_argument("--seed", type=int, default=42)
@@ -90,11 +91,21 @@ args = parser.parse_args()
 torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
 ############################
-# 2. Initialize DDP and set device
+# 2. (Optional) initialize torch.distributed and set device
 ############################
-dist.init_process_group(backend="nccl")
-# local_rank = args.local_rank
-local_rank = int(os.environ["LOCAL_RANK"])
+
+# torchrun sets LOCAL_RANK/WORLD_SIZE. For single-GPU runs, allow bypassing DDP.
+_use_ddp_env = ("LOCAL_RANK" in os.environ) and (int(os.environ.get("WORLD_SIZE", "1")) > 1)
+use_ddp = _use_ddp_env and (not args.no_ddp)
+
+if use_ddp:
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+else:
+    local_rank = 0
+    world_size = 1
+
 device = torch.device("cuda", local_rank)
 torch.cuda.set_device(device)
 
@@ -166,34 +177,35 @@ data = {
 ############################
 # 4. Create DataLoaders (with a DistributedSampler for training)
 ############################
-train_sampler = DistributedSampler(data["train"], shuffle=True, seed=args.seed)
+train_sampler = DistributedSampler(data["train"], shuffle=True, seed=args.seed) if use_ddp else None
 loader_train = DataLoader(
-    data["train"], 
-    batch_size=args.batch_size, 
+    data["train"],
+    batch_size=args.batch_size,
     sampler=train_sampler,
+    shuffle=(train_sampler is None),
     collate_fn=data["train"].collate,
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
     pin_memory=True)
 
-val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False)
+val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False) if use_ddp else None
 loader_val = DataLoader(
     data["val"],
     batch_size=args.batch_size,
     sampler=val_sampler,
-    # shuffle=False,
+    shuffle=False,
     collate_fn=data["val"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
     pin_memory=True
 )
 
-test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False)
+test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False) if use_ddp else None
 loader_test = DataLoader(
     data["test"],
     batch_size=args.batch_size,
     sampler=test_sampler,
-    # shuffle=False,
+    shuffle=False,
     collate_fn=data["test"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
@@ -263,18 +275,17 @@ for name, buf in model.named_buffers():
     if buf.dtype == torch.int16:
         buf.data = buf.data.to(torch.int64)
 
-world_size = dist.get_world_size()
-
 # SyncBatchNorm and find_unused_parameters add overhead; default them off for single-GPU.
 if args.sync_batchnorm and world_size > 1:
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-model = DDP(
-    model,
-    device_ids=[local_rank],
-    # RelGT can have conditional paths; keep unused-parameter detection on by default.
-    find_unused_parameters=not bool(args.ddp_no_find_unused_parameters),
-)
+if use_ddp:
+    model = DDP(
+        model,
+        device_ids=[local_rank],
+        # RelGT can have conditional paths; keep unused-parameter detection on by default.
+        find_unused_parameters=not bool(args.ddp_no_find_unused_parameters),
+    )
 
 if local_rank == 0 and args.print_model:
     print(model)
@@ -303,8 +314,9 @@ def train_supervised(epoch) -> float:
     loss_accum = count_accum = 0
     total_steps = min(len(loader_dict["train"]), args.max_steps_per_epoch)
     
-    train_sampler.set_epoch(epoch)
-    
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+
     for step, batch in enumerate(tqdm(loader_dict["train"], total=total_steps, desc="Train"), start=1):
         # Move tensors to the proper device.
         neighbor_types = batch["neighbor_types"].to(device, non_blocking=True)
@@ -403,7 +415,14 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     local_preds = np.concatenate(pred_list, axis=0) if pred_list else np.array([])
     local_idxs  = np.concatenate(idx_list,  axis=0) if idx_list  else np.array([])
 
-    # Gather on rank 0
+    if world_size == 1:
+        # Single-process fast path.
+        all_preds = np.full((len(loader.dataset),), -100.0)
+        for idx, pred in zip(local_idxs, local_preds):
+            all_preds[idx] = pred
+        return all_preds
+
+    # Multi-process: gather on rank 0
     gathered = [None for _ in range(world_size)] if local_rank == 0 else None
     dist.gather_object((local_idxs, local_preds), object_gather_list=gathered, dst=0)
 
@@ -427,8 +446,9 @@ if args.train_stage == "finetune":
         train_loss = train_supervised(epoch)
         # scheduler.step()
         
-        dist.barrier()
-        eval_model = model.module  # get the underlying model
+        if use_ddp:
+            dist.barrier()
+        eval_model = model.module if use_ddp else model  # get the underlying model
         
         # Run evaluation on the validation set.
         val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
@@ -445,21 +465,27 @@ if args.train_stage == "finetune":
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric
             ):
                 best_val_metric = val_metrics[tune_metric]
-                state_dict = copy.deepcopy(model.module.state_dict())
+                to_save = model.module if use_ddp else model
+                state_dict = copy.deepcopy(to_save.state_dict())
                 torch.save(state_dict, os.path.join(output_path, "finetuned.pt"))
-        dist.barrier()
+        if use_ddp:
+            dist.barrier()
 
     if local_rank == 0 and state_dict is not None:
-        model.module.load_state_dict(state_dict)
-    for param in model.parameters():
-        dist.broadcast(param.data, src=0)
-    for buf in model.buffers():
-        dist.broadcast(buf.data, src=0)
-    dist.barrier()
+        to_load = model.module if use_ddp else model
+        to_load.load_state_dict(state_dict)
+
+    if use_ddp:
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
+        for buf in model.buffers():
+            dist.broadcast(buf.data, src=0)
+        dist.barrier()
 
     # Final evaluation after finetuning:
-    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
-    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+    final_eval_model = model.module if use_ddp else model
+    final_val_preds = test(loader_dict["val"], eval_model=final_eval_model, epoch=0, desc="Val")
+    final_test_preds = test(loader_dict["test"], eval_model=final_eval_model, epoch=0, desc="Test")
 
     if local_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
@@ -483,4 +509,5 @@ if args.train_stage == "finetune":
 ############################
 # 8. Cleanup
 ############################
-dist.destroy_process_group()
+if dist.is_available() and dist.is_initialized():
+    dist.destroy_process_group()
