@@ -71,7 +71,7 @@ parser.add_argument("--num_workers", type=int, default=2)
 parser.add_argument("--log_every", type=int, default=20, help="Log/sync metrics every N train steps")
 parser.add_argument("--detect_anomaly", action="store_true", default=False, help="Enable torch autograd anomaly detection (very slow)")
 parser.add_argument("--print_model", action="store_true", default=False, help="Print full model summary (can be slow)")
-parser.add_argument("--ddp_find_unused_parameters", action="store_true", default=False, help="Set DDP find_unused_parameters=True")
+parser.add_argument("--ddp_no_find_unused_parameters", action="store_true", default=False, help="(Danger) Set DDP find_unused_parameters=False")
 parser.add_argument("--sync_batchnorm", action="store_true", default=False, help="Convert model BatchNorm -> SyncBatchNorm (useful for multi-GPU)")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
@@ -272,7 +272,8 @@ if args.sync_batchnorm and world_size > 1:
 model = DDP(
     model,
     device_ids=[local_rank],
-    find_unused_parameters=bool(args.ddp_find_unused_parameters),
+    # RelGT can have conditional paths; keep unused-parameter detection on by default.
+    find_unused_parameters=not bool(args.ddp_no_find_unused_parameters),
 )
 
 if local_rank == 0 and args.print_model:
